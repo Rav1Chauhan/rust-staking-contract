@@ -16,6 +16,7 @@ pub mod sol_staking {
         let clock = Clock::get()?;
         let pda_account = &mut ctx.accounts.pda_account;
 
+        pda_account.reward_remainder = 0;
         pda_account.owner = ctx.accounts.payer.key();
         pda_account.staked_amount = 0;
         pda_account.total_points = 0;
@@ -163,8 +164,11 @@ pub mod sol_staking {
 
         let elapsed = elapsed_seconds(pda_account.last_update_time, clock.unix_timestamp)?;
 
-        let newly_earned = calculate_points_earned(pda_account.staked_amount, elapsed)?;
-
+        let (newly_earned, _) = calculate_points_earned_with_remainder(
+            pda_account.staked_amount,
+            elapsed,
+            pda_account.reward_remainder,
+        )?;
         let current_total = pda_account
             .total_points
             .checked_add(newly_earned)
@@ -197,33 +201,52 @@ fn update_points(pda_account: &mut StakeAccount, current_time: i64) -> Result<()
     let elapsed = elapsed_seconds(pda_account.last_update_time, current_time)?;
 
     if elapsed > 0 && pda_account.staked_amount > 0 {
-        let earned = calculate_points_earned(pda_account.staked_amount, elapsed)?;
+        let (earned, new_remainder) = calculate_points_earned_with_remainder(
+            pda_account.staked_amount,
+            elapsed,
+            pda_account.reward_remainder,
+        )?;
 
         pda_account.total_points = pda_account
             .total_points
             .checked_add(earned)
             .ok_or(StakeError::Overflow)?;
+
+        pda_account.reward_remainder = new_remainder;
     }
 
     pda_account.last_update_time = current_time;
     Ok(())
 }
 
-fn calculate_points_earned(staked_amount: u64, elapsed_seconds: u64) -> Result<u64> {
-    let numerator = (staked_amount as u128)
-        .checked_mul(elapsed_seconds as u128)
-        .and_then(|v| v.checked_mul(POINTS_PER_SOL_PER_DAY as u128))
-        .ok_or(StakeError::Overflow)?;
-
+fn calculate_points_earned_with_remainder(
+    staked_amount: u64,
+    elapsed_seconds: u64,
+    previous_remainder: u64,
+) -> Result<(u64, u64)> {
     let denominator = (LAMPORTS_PER_SOL as u128)
         .checked_mul(SECONDS_PER_DAY as u128)
         .ok_or(StakeError::Overflow)?;
 
-    let points = numerator
+    let numerator = (staked_amount as u128)
+        .checked_mul(elapsed_seconds as u128)
+        .and_then(|v| v.checked_mul(POINTS_PER_SOL_PER_DAY as u128))
+        .and_then(|v| v.checked_add(previous_remainder as u128))
+        .ok_or(StakeError::Overflow)?;
+
+    let earned = numerator
         .checked_div(denominator)
         .ok_or(StakeError::Overflow)?;
 
-    u64::try_from(points).map_err(|_| error!(StakeError::Overflow))
+    let remainder = numerator
+        .checked_rem(denominator)
+        .ok_or(StakeError::Overflow)?;
+
+    let earned = u64::try_from(earned).map_err(|_| error!(StakeError::Overflow))?;
+
+    let remainder = u64::try_from(remainder).map_err(|_| error!(StakeError::Overflow))?;
+
+    Ok((earned, remainder))
 }
 
 #[derive(Accounts)]
@@ -234,7 +257,7 @@ pub struct CreatePdaAccount<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + 32 + 8 + 8 + 8 + 8 + 1,
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 1+8,
         seeds = [b"client1", payer.key().as_ref()],
         bump
     )]
@@ -310,6 +333,7 @@ pub struct StakeAccount {
     pub claimed_points: u64,
     pub last_update_time: i64,
     pub bump: u8,
+    pub reward_remainder: u64,
 }
 
 #[error_code]
